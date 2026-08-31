@@ -221,7 +221,7 @@ All rights reserved. This software is proprietary and not licensed for redistrib
 
 ## 📞 Contact
 
-For questions or support, reach out to the project maintainer (you).
+For questions or support, reach out to the project maintainer.
 
 ---
 
