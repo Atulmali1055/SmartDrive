@@ -46,6 +46,8 @@ class NotificationFilterManager(
     fun isAllowed(packageName: String): Boolean = settings.isNotificationAllowed(packageName)
 
     fun setAllowed(packageName: String, allowed: Boolean) {
-        settings.setNotificationAllowed(packageName, allowed)
+        val current = settings.notificationFilter.value.toMutableSet()
+        if (allowed) current.add(packageName) else current.remove(packageName)
+        settings.setNotificationFilter(current)
     }
 }

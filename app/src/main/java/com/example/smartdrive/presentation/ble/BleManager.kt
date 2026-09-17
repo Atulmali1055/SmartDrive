@@ -1,7 +1,18 @@
 package com.example.smartdrive.presentation.ble
 
-import android.bluetooth.*
-import android.bluetooth.le.*
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -46,7 +57,7 @@ class BleManager(private val context: Context) {
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private var reconnectRunnable: Runnable? = null
 
-    // Write queue (chunked writes)
+    // Write queue for chunked writes
     private val writeQueue = ConcurrentLinkedQueue<ByteArray>()
     @Volatile private var writing = false
 
@@ -66,6 +77,7 @@ class BleManager(private val context: Context) {
                 }
             }
         }
+
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "Scan failed: $errorCode")
             _connectionState.value = ConnectionState.ERROR("Scan failed ($errorCode)")
@@ -85,9 +97,15 @@ class BleManager(private val context: Context) {
                         Log.i(TAG, "Connected to ${g.device.address}")
                         gatt = g
                         reconnectDevice = g.device
-                        // Request larger MTU for chunked writes
+
+                        // Request a larger MTU for efficient chunked writes.
+                        // This is best-effort — discovery is not gated on it.
                         g.requestMtu(512)
+
+                        // Start service discovery immediately.
+                        g.discoverServices()
                     }
+
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         Log.i(TAG, "Disconnected")
                         closeGatt()
@@ -106,10 +124,18 @@ class BleManager(private val context: Context) {
             }
         }
 
+        /**
+         * MTU negotiation result. Do NOT call discoverServices() from here —
+         * it was already called in onConnectionStateChange. If MTU succeeds,
+         * we just log it; if it fails, the default 23-byte MTU still works
+         * (chunking handles oversized packets).
+         */
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            Log.d(TAG, "MTU changed to $mtu (status=$status)")
-            // After MTU negotiation, discover services
-            g.discoverServices()
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "MTU negotiated: $mtu")
+            } else {
+                Log.d(TAG, "MTU negotiation failed (status=$status), using default")
+            }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
@@ -119,9 +145,10 @@ class BleManager(private val context: Context) {
                 g.disconnect()
                 return
             }
+
             val service = g.getService(SERVICE_UUID)
             if (service == null) {
-                Log.e(TAG, "Service not found")
+                Log.e(TAG, "Service not found (UUID mismatch?)")
                 _connectionState.value = ConnectionState.ERROR("Service not found")
                 g.disconnect()
                 return
@@ -130,23 +157,44 @@ class BleManager(private val context: Context) {
             rxCharacteristic = service.getCharacteristic(RX_CHAR_UUID)
             txCharacteristic = service.getCharacteristic(TX_CHAR_UUID)
 
-            // Subscribe to TX notifications (commands from ESP32)
+            if (rxCharacteristic == null) {
+                Log.e(TAG, "RX characteristic not found")
+                _connectionState.value = ConnectionState.ERROR("RX characteristic missing")
+                g.disconnect()
+                return
+            }
+
+            // Subscribe to TX notifications (commands from ESP32 → phone)
             txCharacteristic?.let { tx ->
                 g.setCharacteristicNotification(tx, true)
                 val cccd = tx.getDescriptor(CCCD_UUID)
                 if (cccd != null) {
                     cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     g.writeDescriptor(cccd)
+                } else {
+                    Log.w(TAG, "CCCD descriptor not found on TX")
                 }
             }
 
             _connectionState.value = ConnectionState.CONNECTED
-            Log.i(TAG, "Services ready")
+            Log.i(TAG, "Services ready — connection fully established")
 
-            // Prime the ESP32 with app info + time + battery
+            // Prime the ESP32 with app info, chunked config, and time
             sendData(BlePacket.encodeAppInfo(appCode = 100, appVersion = "1.0.0"))
             sendData(BlePacket.encodeChunkedConfig(true))
             sendData(BlePacket.encodeTime())
+        }
+
+        override fun onDescriptorWrite(
+            g: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Descriptor write OK (notifications enabled)")
+            } else {
+                Log.w(TAG, "Descriptor write failed: $status")
+            }
         }
 
         override fun onCharacteristicWrite(
@@ -156,11 +204,12 @@ class BleManager(private val context: Context) {
         ) {
             writing = false
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.w(TAG, "Write failed: $status")
+                Log.w(TAG, "Characteristic write failed: $status")
             }
             processWriteQueue()
         }
 
+        // API < 33
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
@@ -170,6 +219,7 @@ class BleManager(private val context: Context) {
             handleIncoming(c.value ?: return)
         }
 
+        // API 33+
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             c: BluetoothGattCharacteristic,
@@ -179,14 +229,14 @@ class BleManager(private val context: Context) {
         }
 
         private fun handleIncoming(value: ByteArray) {
-            if (commandHandler != null && value.isNotEmpty()) {
-                commandHandler!!.handle(value)
-            }
+            if (value.isEmpty()) return
+            Log.d(TAG, "RX from ESP32: ${value.size} bytes")
+            commandHandler?.handle(value)
         }
     }
 
     // ---------------------------------------------------------------
-    // PUBLIC API
+    // PUBLIC API — SCAN
     // ---------------------------------------------------------------
 
     fun startScan() {
@@ -206,7 +256,9 @@ class BleManager(private val context: Context) {
             .build()
 
         bleScanner?.startScan(filters, settings, scanCallback)
-            ?: run { _connectionState.value = ConnectionState.ERROR("Scanner unavailable") }
+            ?: run {
+                _connectionState.value = ConnectionState.ERROR("Scanner unavailable")
+            }
     }
 
     fun stopScan() {
@@ -215,6 +267,10 @@ class BleManager(private val context: Context) {
             _connectionState.value = ConnectionState.DISCONNECTED
         }
     }
+
+    // ---------------------------------------------------------------
+    // PUBLIC API — CONNECT / DISCONNECT
+    // ---------------------------------------------------------------
 
     fun connectToDevice(device: BluetoothDevice) {
         reconnectDevice = device
@@ -232,10 +288,20 @@ class BleManager(private val context: Context) {
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 
-    /** Send a full packet; auto-chunks if > 20 bytes. */
+    // ---------------------------------------------------------------
+    // PUBLIC API — WRITE
+    // ---------------------------------------------------------------
+
+    /**
+     * Send a full packet over BLE. Automatically chunks if > 20 bytes,
+     * using the Chronos chunked format:
+     *
+     *   - First write: 20 bytes as-is (header + len + footer + type + subtype + payload[0..13])
+     *   - Subsequent:  [seq] + up to 19 data bytes
+     */
     fun sendData(packet: ByteArray): Boolean {
         if (gatt == null || rxCharacteristic == null) {
-            Log.e(TAG, "Not connected")
+            Log.w(TAG, "sendData: not connected")
             return false
         }
 
@@ -255,11 +321,13 @@ class BleManager(private val context: Context) {
                 seq++
             }
         }
+
         processWriteQueue()
         return true
     }
 
-    fun sendData(packet: String): Boolean = sendData(packet.toByteArray(Charsets.UTF_8))
+    fun sendData(packet: String): Boolean =
+        sendData(packet.toByteArray(Charsets.UTF_8))
 
     // ---------------------------------------------------------------
     // INTERNALS
@@ -267,23 +335,30 @@ class BleManager(private val context: Context) {
 
     private fun processWriteQueue() {
         if (writing) return
-        val next = writeQueue.poll()
-        if (next == null) return
+        val next = writeQueue.poll() ?: return
         val g = gatt ?: return
         val c = rxCharacteristic ?: return
 
         writing = true
         c.value = next
         c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        if (!g.writeCharacteristic(c)) {
+
+        val ok = try {
+            g.writeCharacteristic(c)
+        } catch (e: Exception) {
+            Log.e(TAG, "writeCharacteristic threw", e)
+            false
+        }
+
+        if (!ok) {
             writing = false
-            Log.w(TAG, "writeCharacteristic returned false")
+            Log.w(TAG, "writeCharacteristic returned false — retrying next")
             processWriteQueue()
         }
     }
 
     private fun closeGatt() {
-        gatt?.close()
+        try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         rxCharacteristic = null
         txCharacteristic = null
@@ -295,7 +370,7 @@ class BleManager(private val context: Context) {
         cancelReconnect()
         reconnectRunnable = Runnable {
             val d = reconnectDevice ?: return@Runnable
-            Log.i(TAG, "Reconnecting to ${d.address}")
+            Log.i(TAG, "Auto-reconnect → ${d.address}")
             _connectionState.value = ConnectionState.CONNECTING
             gatt = d.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
