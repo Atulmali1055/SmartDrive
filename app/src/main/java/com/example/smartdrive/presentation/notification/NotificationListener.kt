@@ -2,10 +2,13 @@ package com.example.smartdrive.presentation.notification
 
 import android.app.Notification
 import android.content.Context
+import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
+import android.provider.ContactsContract
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.telephony.PhoneStateListener
+import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.util.Log
 import com.example.smartdrive.SmartDriveApplication
@@ -21,33 +24,95 @@ class NotificationListener : NotificationListenerService() {
     private val app get() = application as SmartDriveApplication
     private lateinit var telephonyManager: TelephonyManager
 
+    // ---- API 31+ callback ----
+    private var telephonyCallback: TelephonyCallback? = null
+
+    // ---- Legacy callback (< API 31) ----
     @Suppress("DEPRECATION")
-    private val phoneStateListener = object : PhoneStateListener() {
-        @Deprecated("Deprecated in Java")
-        override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-            when (state) {
-                TelephonyManager.CALL_STATE_RINGING -> {
-                    val name = phoneNumber ?: "Unknown"
-                    app.bleManager.sendData(BlePacket.encodeRinger(name, true))
-                }
-                TelephonyManager.CALL_STATE_IDLE -> {
-                    app.bleManager.sendData(BlePacket.encodeRinger("", false))
-                }
-            }
-        }
-    }
+    private var legacyPhoneStateListener: android.telephony.PhoneStateListener? = null
 
     override fun onCreate() {
         super.onCreate()
         telephonyManager = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
-        @Suppress("DEPRECATION")
-        telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
+        registerCallListener()
+        ListenerKeepAliveService.start(this)
     }
 
     override fun onDestroy() {
-        @Suppress("DEPRECATION")
-        telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE)
+        unregisterCallListener()
         super.onDestroy()
+    }
+
+    private fun registerCallListener() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                override fun onCallStateChanged(state: Int) {
+                    handleCallState(state)
+                }
+            }
+            telephonyCallback = cb
+            telephonyManager.registerTelephonyCallback(mainExecutor, cb)
+        } else {
+            @Suppress("DEPRECATION")
+            val listener = object : android.telephony.PhoneStateListener() {
+                override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                    handleCallState(state, phoneNumber)
+                }
+            }
+            legacyPhoneStateListener = listener
+            @Suppress("DEPRECATION")
+            telephonyManager.listen(listener, android.telephony.PhoneStateListener.LISTEN_CALL_STATE)
+        }
+    }
+
+    private fun unregisterCallListener() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            telephonyCallback?.let { telephonyManager.unregisterTelephonyCallback(it) }
+            telephonyCallback = null
+        } else {
+            @Suppress("DEPRECATION")
+            legacyPhoneStateListener?.let {
+                @Suppress("DEPRECATION")
+                telephonyManager.listen(it, android.telephony.PhoneStateListener.LISTEN_NONE)
+            }
+            legacyPhoneStateListener = null
+        }
+    }
+
+    private fun handleCallState(state: Int, phoneNumber: String? = null) {
+        when (state) {
+            TelephonyManager.CALL_STATE_RINGING -> {
+                // API 31+: we don't get the number here; caller info comes via contacts
+                // but for now, we can only show "Incoming"
+                val name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "Incoming call"
+                           else resolveContactName(phoneNumber) ?: phoneNumber ?: "Incoming call"
+                Log.d(TAG, "Ringer start: $name")
+                app.bleManager.sendData(BlePacket.encodeRinger(name, true))
+            }
+            TelephonyManager.CALL_STATE_IDLE -> {
+                app.bleManager.sendData(BlePacket.encodeRinger("", false))
+            }
+        }
+    }
+
+    private fun resolveContactName(number: String?): String? {
+        if (number.isNullOrBlank()) return null
+        return try {
+            val uri = Uri.withAppendedPath(
+                ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                Uri.encode(number)
+            )
+            contentResolver.query(
+                uri,
+                arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME),
+                null, null, null
+            )?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Contact lookup failed", e)
+            null
+        }
     }
 
     override fun onListenerConnected() {
@@ -64,10 +129,13 @@ class NotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        try {
-            handleNotification(sbn)
-        } catch (e: Exception) {
-            Log.e(TAG, "handleNotification error", e)
+        try { handleNotification(sbn) } catch (e: Exception) { Log.e(TAG, "handleNotification", e) }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification) {
+        if (sbn.packageName == "com.google.android.apps.maps") {
+            Log.d(TAG, "Maps notification removed → navigation inactive")
+            app.bleManager.sendData(BlePacket.encodeNavigationInactive())
         }
     }
 
@@ -78,7 +146,7 @@ class NotificationListener : NotificationListenerService() {
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
         val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString() ?: ""
 
-        // ==== GOOGLE MAPS: always forwarded, bypasses filter ====
+        // ---- Google Maps: always forwarded ----
         if (pkg == "com.google.android.apps.maps") {
             val nav = MapsParser.parse(title, text, bigText)
             if (nav.distanceMeters == 0 && text.contains("Arrived", ignoreCase = true)) {
@@ -98,12 +166,11 @@ class NotificationListener : NotificationListenerService() {
             return
         }
 
-        // ==== OTHER APPS: filter check ====
+        // ---- Other apps: filter ----
         if (!app.settings.isNotificationAllowed(pkg)) {
-            Log.d(TAG, "Filtered out: $pkg")
+            Log.d(TAG, "Filtered: $pkg")
             return
         }
-
         if (title.isBlank() && text.isBlank() && bigText.isBlank()) return
 
         val icon = iconForPackage(pkg)
@@ -124,6 +191,4 @@ class NotificationListener : NotificationListenerService() {
         "com.google.android.apps.messaging" -> BlePacket.ICON_MESSAGE
         else -> BlePacket.ICON_DEFAULT
     }
-
-    override fun onNotificationRemoved(sbn: StatusBarNotification) {}
 }

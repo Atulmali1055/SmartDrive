@@ -1,7 +1,6 @@
 package com.example.smartdrive
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -18,7 +17,7 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { /* results ignored; user can re-grant from settings */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,6 +46,7 @@ class MainActivity : ComponentActivity() {
         }
         needed += Manifest.permission.ACCESS_FINE_LOCATION
         needed += Manifest.permission.READ_PHONE_STATE
+        needed += Manifest.permission.READ_CONTACTS
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             needed += Manifest.permission.POST_NOTIFICATIONS
         }

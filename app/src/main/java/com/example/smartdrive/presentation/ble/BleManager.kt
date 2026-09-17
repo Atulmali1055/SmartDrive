@@ -1,20 +1,10 @@
 package com.example.smartdrive.presentation.ble
 
-import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.bluetooth.*
+import android.bluetooth.le.*
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,35 +12,22 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 
-@SuppressLint("MissingPermission")
-class BleManager(val context: Context) {
+class BleManager(private val context: Context) {
 
     companion object {
         private const val TAG = "BleManager"
-
-        @Volatile
-        private var INSTANCE: BleManager? = null
-
-        fun get(context: Context): BleManager {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: BleManager(context.applicationContext).also { INSTANCE = it }
-            }
-        }
-
-        // Service & characteristic UUIDs (matching ESP32)
-        val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
-        val RX_CHAR_UUID: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")   // Write (Phone -> ESP32)
-        val TX_CHAR_UUID: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")   // Notify (ESP32 -> Phone)
-        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        val SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+        val RX_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+        val TX_CHAR_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val RECONNECT_DELAY_MS = 3000L
     }
 
-    private val bluetoothManager: BluetoothManager by lazy {
+    private val bluetoothManager: BluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    }
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private val bleScanner: BluetoothLeScanner? = bluetoothAdapter?.bluetoothLeScanner
 
-    // UI state
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -60,124 +37,157 @@ class BleManager(val context: Context) {
     private var gatt: BluetoothGatt? = null
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
     private var txCharacteristic: BluetoothGattCharacteristic? = null
+
     private var commandHandler: BleCommandHandler? = null
+    fun setCommandHandler(handler: BleCommandHandler) { commandHandler = handler }
 
+    // Reconnect bookkeeping
+    private var reconnectDevice: BluetoothDevice? = null
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private var reconnectRunnable: Runnable? = null
+
+    // Write queue (chunked writes)
     private val writeQueue = ConcurrentLinkedQueue<ByteArray>()
-    @Volatile
-    private var writing = false
+    @Volatile private var writing = false
 
-    fun setCommandHandler(handler: BleCommandHandler) {
-        commandHandler = handler
-    }
+    // ---------------------------------------------------------------
+    // SCAN CALLBACK
+    // ---------------------------------------------------------------
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val name = device.name ?: return
-            val rssi = result.rssi
-            if (name == "MY NAV") {
-                val bleDevice = BleDevice(device, rssi, name)
-                if (_discoveredDevices.value.none { it.device.address == device.address }) {
-                    _discoveredDevices.value = _discoveredDevices.value + bleDevice
+            if (name == "MY NAV" || name == "SmartDrive") {
+                val bleDevice = BleDevice(device, result.rssi, name)
+                val existing = _discoveredDevices.value
+                if (existing.none { it.device.address == device.address }) {
+                    _discoveredDevices.value = existing + bleDevice
                 }
             }
         }
-
         override fun onScanFailed(errorCode: Int) {
-            Log.e(TAG, "Scan failed with error $errorCode")
-            _connectionState.value = ConnectionState.ERROR("Scan failed")
+            Log.e(TAG, "Scan failed: $errorCode")
+            _connectionState.value = ConnectionState.ERROR("Scan failed ($errorCode)")
         }
     }
 
+    // ---------------------------------------------------------------
+    // GATT CALLBACK
+    // ---------------------------------------------------------------
+
     private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
-                        _connectionState.value = ConnectionState.CONNECTED
-                        Log.i(TAG, "Connected to ${gatt.device.address}")
-                        gatt.discoverServices()
+                        Log.i(TAG, "Connected to ${g.device.address}")
+                        gatt = g
+                        reconnectDevice = g.device
+                        // Request larger MTU for chunked writes
+                        g.requestMtu(512)
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        _connectionState.value = ConnectionState.DISCONNECTED
-                        resetGatt()
                         Log.i(TAG, "Disconnected")
+                        closeGatt()
+                        if (reconnectDevice != null) {
+                            _connectionState.value = ConnectionState.RECONNECTING
+                            scheduleReconnect()
+                        } else {
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                        }
                     }
                 }
             } else {
                 Log.e(TAG, "Connection state change error: $status")
+                closeGatt()
                 _connectionState.value = ConnectionState.ERROR("GATT error $status")
-                resetGatt()
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt.getService(SERVICE_UUID)
-                if (service != null) {
-                    rxCharacteristic = service.getCharacteristic(RX_CHAR_UUID)
-                    val txChar = service.getCharacteristic(TX_CHAR_UUID)
-                    txChar?.let {
-                        txCharacteristic = it
-                        gatt.setCharacteristicNotification(it, true)
-                        val cccd = it.getDescriptor(CCCD_UUID)
-                        if (cccd != null) {
-                            @Suppress("DEPRECATION")
-                            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            @Suppress("DEPRECATION")
-                            gatt.writeDescriptor(cccd)
-                        }
-                    }
-                    _connectionState.value = ConnectionState.CONNECTED
-                    Log.i(TAG, "Services discovered")
-                } else {
-                    Log.e(TAG, "Service not found")
-                    _connectionState.value = ConnectionState.ERROR("Service not found")
-                    gatt.disconnect()
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            Log.d(TAG, "MTU changed to $mtu (status=$status)")
+            // After MTU negotiation, discover services
+            g.discoverServices()
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "Service discovery failed: $status")
+                _connectionState.value = ConnectionState.ERROR("Service discovery failed")
+                g.disconnect()
+                return
+            }
+            val service = g.getService(SERVICE_UUID)
+            if (service == null) {
+                Log.e(TAG, "Service not found")
+                _connectionState.value = ConnectionState.ERROR("Service not found")
+                g.disconnect()
+                return
+            }
+
+            rxCharacteristic = service.getCharacteristic(RX_CHAR_UUID)
+            txCharacteristic = service.getCharacteristic(TX_CHAR_UUID)
+
+            // Subscribe to TX notifications (commands from ESP32)
+            txCharacteristic?.let { tx ->
+                g.setCharacteristicNotification(tx, true)
+                val cccd = tx.getDescriptor(CCCD_UUID)
+                if (cccd != null) {
+                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    g.writeDescriptor(cccd)
                 }
-            } else {
-                Log.e(TAG, "Service discovery error: $status")
-                _connectionState.value = ConnectionState.ERROR("Service discovery error")
-                gatt.disconnect()
             }
-        }
 
-        @Suppress("DEPRECATION")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            if (characteristic.uuid == TX_CHAR_UUID) {
-                val data = characteristic.value ?: return
-                commandHandler?.handle(data)
-            }
+            _connectionState.value = ConnectionState.CONNECTED
+            Log.i(TAG, "Services ready")
+
+            // Prime the ESP32 with app info + time + battery
+            sendData(BlePacket.encodeAppInfo(appCode = 100, appVersion = "1.0.0"))
+            sendData(BlePacket.encodeChunkedConfig(true))
+            sendData(BlePacket.encodeTime())
         }
 
         override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
+            g: BluetoothGatt,
+            c: BluetoothGattCharacteristic,
             status: Int
         ) {
             writing = false
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "Write successful")
-            } else {
-                Log.e(TAG, "Write failed: $status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "Write failed: $status")
             }
             processWriteQueue()
         }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            c: BluetoothGattCharacteristic
+        ) {
+            @Suppress("DEPRECATION")
+            handleIncoming(c.value ?: return)
+        }
+
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            c: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            handleIncoming(value)
+        }
+
+        private fun handleIncoming(value: ByteArray) {
+            if (commandHandler != null && value.isNotEmpty()) {
+                commandHandler!!.handle(value)
+            }
+        }
     }
 
-    private fun resetGatt() {
-        this@BleManager.gatt?.close()
-        this@BleManager.gatt = null
-        rxCharacteristic = null
-        txCharacteristic = null
-        writeQueue.clear()
-        writing = false
-    }
-
-    // Public methods
+    // ---------------------------------------------------------------
+    // PUBLIC API
+    // ---------------------------------------------------------------
 
     fun startScan() {
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
@@ -187,17 +197,16 @@ class BleManager(val context: Context) {
         _discoveredDevices.value = emptyList()
         _connectionState.value = ConnectionState.SCANNING
 
-        val scanFilters = listOf(
-            ScanFilter.Builder().setDeviceName("MY NAV").build()
+        val filters = listOf(
+            ScanFilter.Builder().setDeviceName("MY NAV").build(),
+            ScanFilter.Builder().setDeviceName("SmartDrive").build()
         )
-        val scanSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        bleScanner?.startScan(scanFilters, scanSettings, scanCallback)
-            ?: run {
-                _connectionState.value = ConnectionState.ERROR("Scanner not available")
-            }
+        bleScanner?.startScan(filters, settings, scanCallback)
+            ?: run { _connectionState.value = ConnectionState.ERROR("Scanner unavailable") }
     }
 
     fun stopScan() {
@@ -208,20 +217,22 @@ class BleManager(val context: Context) {
     }
 
     fun connectToDevice(device: BluetoothDevice) {
-        if (gatt != null) {
-            resetGatt()
-        }
+        reconnectDevice = device
+        cancelReconnect()
+        closeGatt()
         _connectionState.value = ConnectionState.CONNECTING
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     fun disconnect() {
+        reconnectDevice = null
+        cancelReconnect()
         gatt?.disconnect()
-        resetGatt()
+        closeGatt()
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 
-    /** Send a full packet, automatically chunking if > 20 bytes. */
+    /** Send a full packet; auto-chunks if > 20 bytes. */
     fun sendData(packet: ByteArray): Boolean {
         if (gatt == null || rxCharacteristic == null) {
             Log.e(TAG, "Not connected")
@@ -229,12 +240,9 @@ class BleManager(val context: Context) {
         }
 
         if (packet.size <= 20) {
-            // Single write
             writeQueue.add(packet)
         } else {
-            // Chunk 1: first 20 bytes as-is
             writeQueue.add(packet.copyOfRange(0, 20))
-            // Chunks 2..N: [seq][up to 19 bytes]
             var offset = 20
             var seq = 0
             while (offset < packet.size) {
@@ -247,31 +255,57 @@ class BleManager(val context: Context) {
                 seq++
             }
         }
-
         processWriteQueue()
         return true
     }
 
+    fun sendData(packet: String): Boolean = sendData(packet.toByteArray(Charsets.UTF_8))
+
+    // ---------------------------------------------------------------
+    // INTERNALS
+    // ---------------------------------------------------------------
+
     private fun processWriteQueue() {
         if (writing) return
-        val next = writeQueue.poll() ?: return
+        val next = writeQueue.poll()
+        if (next == null) return
         val g = gatt ?: return
-        val ch = rxCharacteristic ?: return
+        val c = rxCharacteristic ?: return
 
         writing = true
-        @Suppress("DEPRECATION")
-        ch.value = next
-        ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        @Suppress("DEPRECATION")
-        if (!g.writeCharacteristic(ch)) {
+        c.value = next
+        c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        if (!g.writeCharacteristic(c)) {
             writing = false
-            Log.e(TAG, "writeCharacteristic returned false")
-            processWriteQueue() // try next
+            Log.w(TAG, "writeCharacteristic returned false")
+            processWriteQueue()
         }
     }
 
-    // Keep the String overload for backward compat
-    fun sendData(packet: String): Boolean = sendData(packet.toByteArray(Charsets.UTF_8))
+    private fun closeGatt() {
+        gatt?.close()
+        gatt = null
+        rxCharacteristic = null
+        txCharacteristic = null
+        writing = false
+        writeQueue.clear()
+    }
+
+    private fun scheduleReconnect() {
+        cancelReconnect()
+        reconnectRunnable = Runnable {
+            val d = reconnectDevice ?: return@Runnable
+            Log.i(TAG, "Reconnecting to ${d.address}")
+            _connectionState.value = ConnectionState.CONNECTING
+            gatt = d.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        }
+        reconnectHandler.postDelayed(reconnectRunnable!!, RECONNECT_DELAY_MS)
+    }
+
+    private fun cancelReconnect() {
+        reconnectRunnable?.let { reconnectHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+    }
 }
 
 sealed class ConnectionState {
