@@ -1,5 +1,8 @@
 package com.example.smartdrive.presentation.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -9,8 +12,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -76,12 +84,60 @@ fun HomeScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                // Only show the "go to Bluetooth" hint when there's something to do
+                // Show the "go to Bluetooth" hint when there's something to do
                 if (state !is ConnectionState.CONNECTED) {
                     OutlinedButton(
                         onClick = onNavigateToBluetooth,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Open Bluetooth tab to connect") }
+                }
+            }
+        }
+
+        // -------------------------------------------------------------
+        // Send-status banner (auto-hides after 3s via VM timer)
+        // -------------------------------------------------------------
+        AnimatedVisibility(
+            visible = sendStatus != null,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            val isError = sendStatus?.contains("fail", ignoreCase = true) == true ||
+                    sendStatus?.contains("Not connected", ignoreCase = true) == true
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isError)
+                        MaterialTheme.colorScheme.errorContainer
+                    else
+                        MaterialTheme.colorScheme.primaryContainer
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isError) Icons.Default.Error
+                        else Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = if (isError)
+                            MaterialTheme.colorScheme.onErrorContainer
+                        else
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = sendStatus ?: "",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isError)
+                            MaterialTheme.colorScheme.onErrorContainer
+                        else
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                    )
                 }
             }
         }
@@ -122,13 +178,6 @@ fun HomeScreen(
                     enabled = state is ConnectionState.CONNECTED
                 ) { Text("Stop Navigation on Device") }
             }
-        }
-
-        // -------------------------------------------------------------
-        // Status feedback
-        // -------------------------------------------------------------
-        sendStatus?.let {
-            Text(it, style = MaterialTheme.typography.bodySmall)
         }
 
         Spacer(Modifier.weight(1f))

@@ -81,18 +81,7 @@ fun SmartDriveApp(app: SmartDriveApplication) {
             startDestination = Screen.Home.route,
             modifier = Modifier.padding(inner)
         ) {
-            composable(Screen.Home.route) {
-                HomeScreen(
-                    vm = vm,
-                    onNavigateToBluetooth = {
-                        navController.navigate(Screen.Bluetooth.route) {
-                            popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    }
-                )
-            }
+            composable(Screen.Home.route)          { HomeScreen(vm) }
             composable(Screen.Navigation.route)    { NavigationScreen(vm) }
             composable(Screen.Notifications.route) { NotificationsScreen(vm, app) }
             composable(Screen.Weather.route)       { WeatherScreen(vm, app) }

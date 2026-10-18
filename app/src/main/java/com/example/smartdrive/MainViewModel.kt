@@ -14,6 +14,8 @@ import com.example.smartdrive.presentation.ble.BlePacket
 import com.example.smartdrive.presentation.ble.ConnectionState
 import com.example.smartdrive.presentation.notification.NotificationListener
 import com.example.smartdrive.presentation.settings.AppSettings
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -37,6 +39,10 @@ class MainViewModel(
 
     private val _sendStatus = MutableStateFlow<String?>(null)
     val sendStatus: StateFlow<String?> = _sendStatus.asStateFlow()
+
+    // Tracks the pending auto-clear job so we can cancel it if a new
+    // status is set before the previous one expires.
+    private var sendStatusClearJob: Job? = null
 
     init {
         // Whenever the connection becomes CONNECTED, sync settings to the device.
@@ -82,9 +88,14 @@ class MainViewModel(
 
     /**
      * Whether our NotificationListenerService is currently authorized by the user.
-     * Uses the platform constant (Settings.Secure.ENABLED_NOTIFICATION_LISTENERS)
-     * and matches against both the long and short component name forms — some
-     * OEM ROMs store one, some the other.
+     *
+     * Note: Settings.Secure.ENABLED_NOTIFICATION_LISTENERS resolves to the same
+     * string we use here ("enabled_notification_listeners"). We use the literal
+     * because the platform constant symbol doesn't resolve reliably in every
+     * project setup (name collision with other Settings symbols in scope).
+     *
+     * Matches both the long and short component-name forms — some OEM ROMs
+     * store one, some the other.
      */
     fun isNotificationListenerEnabled(): Boolean {
         val cn = ComponentName(context, NotificationListener::class.java)
@@ -109,8 +120,7 @@ class MainViewModel(
      */
     private fun syncSettingsToDevice() {
         val hour24 = settings.use24Hour.value
-        val cfg = BlePacket.encodeHour24Config(hour24)
-        bleManager.sendData(cfg)
+        bleManager.sendData(BlePacket.encodeHour24Config(hour24))
     }
 
     /**
@@ -127,7 +137,6 @@ class MainViewModel(
     fun setWeatherEnabled(enabled: Boolean) {
         settings.setWeatherEnabled(enabled)
         // Weather enable/disable is a phone-side decision; no BLE packet needed.
-        // The ESP32 only receives weather when the phone decides to send it.
     }
 
     // ---------------------------------------------------------------
@@ -135,6 +144,10 @@ class MainViewModel(
     // ---------------------------------------------------------------
 
     fun sendTestNavigation() {
+        if (bleManager.connectionState.value !is ConnectionState.CONNECTED) {
+            setSendStatus("Not connected")
+            return
+        }
         val packet = BlePacket.encodeNavigation(
             title = "350 m",
             duration = "18 min",
@@ -143,20 +156,71 @@ class MainViewModel(
             directions = "Turn right onto MG Road",
             speed = ""
         )
-        bleManager.sendData(packet)
+        val ok = bleManager.sendData(packet)
+        setSendStatus(if (ok) "Test navigation sent" else "Send failed")
     }
 
     fun sendNavigationInactive() {
-        bleManager.sendData(BlePacket.encodeNavigationInactive())
+        if (bleManager.connectionState.value !is ConnectionState.CONNECTED) {
+            setSendStatus("Not connected")
+            return
+        }
+        val ok = bleManager.sendData(BlePacket.encodeNavigationInactive())
+        setSendStatus(if (ok) "Navigation stopped on device" else "Send failed")
     }
 
     fun sendTime() {
-        bleManager.sendData(BlePacket.encodeTime())
+        if (bleManager.connectionState.value !is ConnectionState.CONNECTED) {
+            setSendStatus("Not connected")
+            return
+        }
+        val ok = bleManager.sendData(BlePacket.encodeTime())
+        setSendStatus(if (ok) "Time sent" else "Send failed")
     }
 
     fun sendPhoneBattery() {
+        if (bleManager.connectionState.value !is ConnectionState.CONNECTED) {
+            setSendStatus("Not connected")
+            return
+        }
         val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-        bleManager.sendData(BlePacket.encodePhoneBattery(level, bm.isCharging))
+        val ok = bleManager.sendData(BlePacket.encodePhoneBattery(level, bm.isCharging))
+        setSendStatus(if (ok) "Battery $level% sent" else "Send failed")
+    }
+
+    // ---------------------------------------------------------------
+    // Send-status helpers
+    // ---------------------------------------------------------------
+
+    /**
+     * Set the current send-status message and auto-clear it after
+     * [AUTO_CLEAR_MS] milliseconds. If another status arrives before the
+     * timeout, the previous timer is cancelled so the newer message gets
+     * the full display duration.
+     */
+    private fun setSendStatus(message: String) {
+        _sendStatus.value = message
+        sendStatusClearJob?.cancel()
+        sendStatusClearJob = viewModelScope.launch {
+            delay(AUTO_CLEAR_MS)
+            _sendStatus.value = null
+        }
+    }
+
+    /** Manually clear the status (e.g., when the user navigates away). */
+    fun clearSendStatus() {
+        sendStatusClearJob?.cancel()
+        sendStatusClearJob = null
+        _sendStatus.value = null
+    }
+
+    override fun onCleared() {
+        sendStatusClearJob?.cancel()
+        super.onCleared()
+    }
+
+    companion object {
+        private const val AUTO_CLEAR_MS = 3_000L
     }
 }

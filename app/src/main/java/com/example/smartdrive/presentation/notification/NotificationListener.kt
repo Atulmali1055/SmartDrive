@@ -11,6 +11,7 @@ import android.service.notification.StatusBarNotification
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.smartdrive.SmartDriveApplication
 import com.example.smartdrive.presentation.ble.BlePacket
 import com.example.smartdrive.presentation.navigation.MapsParser
@@ -44,6 +45,15 @@ class NotificationListener : NotificationListenerService() {
     }
 
     private fun registerCallListener() {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.READ_PHONE_STATE
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "READ_PHONE_STATE permission missing, skipping call listener registration")
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
                 override fun onCallStateChanged(state: Int) {
